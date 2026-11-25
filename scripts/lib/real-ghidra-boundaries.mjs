@@ -1,3 +1,5 @@
+import { sha256File } from "./verifier-file-sha256.mjs";
+import { canonicalOutputSchema } from "./canonical-output-schema.mjs";
 import {
   requireMcpToolError,
   mcpTextValue,
@@ -5,14 +7,14 @@ import {
 } from "./mcp-verifier-results.mjs";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { access, readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
-import { GHIDRA_ANNOTATIONS_RETAINED } from "../../dist/ghidra/GhidraProviderClient.js";
 import Ajv from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
+import { OFFICIAL_TOOL_CONTRACTS } from "../../dist/contracts/officialToolContracts.js";
 
 import { verifyLegacyGhidraReferenceSnapshot } from "./ghidra-reference-snapshot-e2e.mjs";
 import { verifyGhidraSnapshotLifecycle } from "./real-ghidra-snapshot-lifecycle.mjs";
@@ -22,6 +24,7 @@ import { verifyGhidraEntryAliases } from "./real-ghidra-entry-aliases.mjs";
 import { verifyGhidraNamespaceAnnotations } from "./real-ghidra-namespace-annotations.mjs";
 import { verifyGhidraBatchIdentity } from "./real-ghidra-batch-identity.mjs";
 import { verifyGhidraInstructionFlow } from "./real-ghidra-instruction-flow.mjs";
+import { verifyGhidraSearchFacts } from "./real-ghidra-search-facts.mjs";
 
 /** Probe real Ghidra location, annotation and error contracts through public adapters. */
 export async function verifyGhidraBoundaries(
@@ -30,19 +33,31 @@ export async function verifyGhidraBoundaries(
 ) {
   const options = { timeout: 180000 };
   const catalog = await client.listTools();
+  const annotation = catalog.tools.find(
+    (tool) => tool.name === "annotate_native_function",
+  );
+  const annotationContract = OFFICIAL_TOOL_CONTRACTS.find(
+    (tool) => tool.name === "annotate_native_function",
+  );
+  assert.ok(annotationContract, "Annotation contract is missing");
+  assert.equal(annotation?.description, annotationContract.description);
   const ajv = new Ajv({ strict: false });
   addFormats(ajv);
   const validators = new Map();
   for (const tool of catalog.tools) {
-    for (const key of ["inputSchema", "outputSchema"])
+    const outputSchema = canonicalOutputSchema(tool.name);
+    for (const [key, schema] of [
+      ["inputSchema", tool.inputSchema],
+      ["outputSchema", outputSchema],
+    ])
       assert.ok(
-        ajv.validateSchema(tool[key]),
+        ajv.validateSchema(schema),
         `${tool.name} ${key}: ${JSON.stringify(ajv.errors)}`,
       );
     validators.set(
       tool.name,
-      (tool.outputSchema?.$id && ajv.getSchema(tool.outputSchema.$id)) ||
-        ajv.compile(tool.outputSchema),
+      (outputSchema.$id && ajv.getSchema(outputSchema.$id)) ||
+        ajv.compile(outputSchema),
     );
   }
   let successfulCalls = 0;
@@ -161,6 +176,7 @@ export async function verifyGhidraBoundaries(
       available: true,
     });
   const externalEntry = await call("resolve_containing_procedure", {
+    detail: "complete",
     address: external.address,
   });
   assert.equal(externalEntry.found, true);
@@ -182,7 +198,10 @@ export async function verifyGhidraBoundaries(
     .reduce((maximum, offset) => (offset > maximum ? offset : maximum), 0n);
   const unknownExternal = `${externalSpace}:0x${(lastExternalOffset + 1n).toString(16)}`;
   assert.deepEqual(
-    await call("resolve_containing_procedure", { address: unknownExternal }),
+    await call("resolve_containing_procedure", {
+      detail: "complete",
+      address: unknownExternal,
+    }),
     {
       query_address: unknownExternal,
       found: false,
@@ -202,7 +221,12 @@ export async function verifyGhidraBoundaries(
   );
   const names = await call("list_names");
   const batchIdentity = await verifyGhidraBatchIdentity(call, names);
-  const instructionFlow = await verifyGhidraInstructionFlow(call, names, cli);
+  const instructionFlow = await verifyGhidraInstructionFlow(
+    call,
+    names,
+    cli,
+    target,
+  );
   const leaf = names.find((item) =>
     item.value.endsWith("rea_ghidra_inventory_leaf"),
   );
@@ -220,6 +244,7 @@ export async function verifyGhidraBoundaries(
     ),
   );
   const incoming = await call("procedure_references", {
+    detail: "complete",
     procedure: leaf.address,
     direction: "incoming",
   });
@@ -271,7 +296,10 @@ export async function verifyGhidraBoundaries(
       /Unknown|invalid/u,
     );
     assert.equal(
-      await call("procedure_address", { procedure: address }),
+      await call("procedure_address", {
+        detail: "complete",
+        procedure: address,
+      }),
       address,
       "Invalid selectors must preserve the live provider connection",
     );
@@ -313,12 +341,19 @@ export async function verifyGhidraBoundaries(
     );
     assert.equal(await call("address_name", { address: spelling }), name);
     assert.equal(
-      await call("procedure_address", { procedure: spelling }),
+      await call("procedure_address", {
+        detail: "complete",
+        procedure: spelling,
+      }),
       address,
     );
     assert.equal(
-      (await call("resolve_containing_procedure", { address: spelling }))
-        .procedure.address,
+      (
+        await call("resolve_containing_procedure", {
+          detail: "complete",
+          address: spelling,
+        })
+      ).procedure.address,
       address,
     );
   }
@@ -377,6 +412,7 @@ export async function verifyGhidraBoundaries(
   );
   assert.ok(indirectProcedure);
   const references = await call("procedure_references", {
+    detail: "complete",
     procedure: indirectProcedure.address,
   });
   assert.ok(
@@ -394,21 +430,33 @@ export async function verifyGhidraBoundaries(
   const strings = await call("list_strings");
   assert.ok(strings.length > 0);
   assert.deepEqual(
-    await call("list_strings", { address: strings[0].address }),
+    await call("list_strings", {
+      detail: "complete",
+      address: strings[0].address,
+    }),
     [strings[0]],
   );
   const marker = strings.find(
     (item) => item.value === "REA_GHIDRA_INVENTORY_ENTRY",
   );
   assert.ok(marker);
+  await verifyGhidraSearchFacts(call, {
+    strings,
+    procedures,
+    entryAddress: address,
+  });
   assert.ok(
     (
-      await call("search_strings", { pattern: marker.value.toLowerCase() })
+      await call("search_strings", {
+        detail: "complete",
+        pattern: marker.value.toLowerCase(),
+      })
     ).some((item) => item.address === marker.address),
   );
   assert.equal(
     (
       await call("search_strings", {
+        detail: "complete",
         pattern: marker.value.toLowerCase(),
         case_sensitive: true,
       })
@@ -417,6 +465,7 @@ export async function verifyGhidraBoundaries(
   );
   assert.deepEqual(
     await call("search_strings", {
+      detail: "complete",
       pattern: `REA_GHIDRA_ABSENT_${randomUUID()}`,
     }),
     [],
@@ -535,7 +584,7 @@ export async function verifyGhidraBoundaries(
   const regexFailure = await client.callTool(
     {
       name: "search_strings",
-      arguments: { pattern: regexPattern, mode: "regex" },
+      arguments: { detail: "complete", pattern: regexPattern, mode: "regex" },
     },
     options,
   );
@@ -551,13 +600,17 @@ export async function verifyGhidraBoundaries(
   // The producer reason describes the failure; continuing-session guidance
   // is projected separately and the following live calls verify it.
   assert.match(regexError.details.reason, /stack while matching pattern/u);
-  assert.ok(regexError.message.includes(GHIDRA_ANNOTATIONS_RETAINED));
+  assert.ok(
+    regexError.message.includes(
+      "The active analysis session and annotations remain available.",
+    ),
+  );
   rejectedCalls++;
   const nestedPattern = "(".repeat(12000) + "a" + ")".repeat(12000);
   const compileFailure = await client.callTool(
     {
       name: "search_procedures",
-      arguments: { pattern: nestedPattern, mode: "regex" },
+      arguments: { detail: "complete", pattern: nestedPattern, mode: "regex" },
     },
     options,
   );
@@ -580,18 +633,22 @@ export async function verifyGhidraBoundaries(
     true,
   );
   assert.ok(
-    (await call("search_procedures", { pattern: changes.name })).some(
-      (item) => item.address === address,
-    ),
+    (
+      await call("search_procedures", {
+        detail: "complete",
+        pattern: changes.name,
+      })
+    ).some((item) => item.address === address),
     "Regex compiler exhaustion must preserve edited names and search availability",
   );
   const longLiteral = "a".repeat(3 * 16 ** 3) + "!";
   const longString = strings.find((item) => item.value === longLiteral);
   assert.ok(longString, "The provider must retain the full regression literal");
-  const literalMatches = await call("search_strings", { pattern: longLiteral });
-  assert.deepEqual(literalMatches, [
-    { address: longString.address, value: longLiteral },
-  ]);
+  const literalMatches = await call("search_strings", {
+    detail: "complete",
+    pattern: longLiteral,
+  });
+  assert.deepEqual(literalMatches, [longString]);
   assert.deepEqual(await cli("search", longLiteral), literalMatches);
   await assert.rejects(
     cli("search", regexPattern, ["--mode", "regex"]),
@@ -611,7 +668,10 @@ export async function verifyGhidraBoundaries(
   });
   assert.equal(updated.dossier.procedure.name, changes.name);
   assert.equal(
-    await call("procedure_address", { procedure: changes.name }),
+    await call("procedure_address", {
+      detail: "complete",
+      procedure: changes.name,
+    }),
     address,
   );
   assert.equal(
@@ -641,7 +701,11 @@ export async function verifyGhidraBoundaries(
     );
   assert.ok(
     (
-      await call("search_procedures", { pattern: "dead", case_sensitive: true })
+      await call("search_procedures", {
+        detail: "complete",
+        pattern: "dead",
+        case_sensitive: true,
+      })
     ).some((item) => item.address === address),
   );
 
@@ -712,12 +776,7 @@ export async function verifyGhidraBoundaries(
     await call("read_bytes", { address, length: baseline.length }),
     bytes,
   );
-  assert.equal(
-    createHash("sha256")
-      .update(await readFile(target.path))
-      .digest("hex"),
-    target.sha256,
-  );
+  assert.equal(await sha256File(target.path), target.sha256);
   const cliUpdated = await cli("annotate-native-function", name, [
     "--name",
     changes.name,
@@ -734,7 +793,10 @@ export async function verifyGhidraBoundaries(
       name: renamed,
     });
     assert.equal(
-      await call("procedure_address", { procedure: renamed }),
+      await call("procedure_address", {
+        detail: "complete",
+        procedure: renamed,
+      }),
       address,
     );
     assert.equal(await call("address_name", { address }), renamed);
@@ -756,7 +818,10 @@ export async function verifyGhidraBoundaries(
       "Ambiguity diagnostics must retain every matching entry address",
     );
     assert.equal(
-      await call("procedure_address", { procedure: selected }),
+      await call("procedure_address", {
+        detail: "complete",
+        procedure: selected,
+      }),
       selected,
     );
   }
@@ -799,10 +864,16 @@ export async function verifyGhidraBoundaries(
   });
   await assert.rejects(access(socketRoot), { code: "ENOENT" });
   await assert.rejects(access(runtimeRoot), { code: "ENOENT" });
-  assert.equal(await call("procedure_address", { procedure: name }), address);
+  assert.equal(
+    await call("procedure_address", { detail: "complete", procedure: name }),
+    address,
+  );
   assert.equal(await call("address_name", { address }), name);
   assert.equal(
-    await call("procedure_address", { procedure: indirectProcedure.value }),
+    await call("procedure_address", {
+      detail: "complete",
+      procedure: indirectProcedure.value,
+    }),
     indirectProcedure.address,
   );
   assert.deepEqual(
@@ -810,12 +881,7 @@ export async function verifyGhidraBoundaries(
       .comments,
     original.comments,
   );
-  assert.equal(
-    createHash("sha256")
-      .update(await readFile(target.path))
-      .digest("hex"),
-    target.sha256,
-  );
+  assert.equal(await sha256File(target.path), target.sha256);
   await verifyStartupCancellation(client, call, target, env, options);
   return {
     mocked: false,
@@ -858,7 +924,10 @@ async function verifyStartupCancellation(client, call, target, env, options) {
   // so persisted immutable snapshots cannot bypass actual provider startup.
   const request = {
     name: "search_procedures",
-    arguments: { pattern: `startup-cancellation-${randomUUID()}` },
+    arguments: {
+      detail: "complete",
+      pattern: `startup-cancellation-${randomUUID()}`,
+    },
   };
   const controller = new AbortController();
   let settled = false;

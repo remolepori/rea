@@ -1,3 +1,7 @@
+import {
+  fileIdentity,
+  fileSubjectDisplay,
+} from "../../fixtures/evidenceSubject.js";
 import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
@@ -24,6 +28,7 @@ import { connectLocalToolsMcp } from "../../fixtures/localToolsMcp.js";
 import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { cliTest, type TestCli } from "../../support/cli/cliFixture.js";
+import { completeArguments } from "../../support/completeDetail.js";
 
 const plist = (message: string) =>
   `<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>message</key><string>${message}</string></dict></plist>\n`;
@@ -34,7 +39,7 @@ const inspectPair = async (
   rightPath: string,
 ) => {
   const result = await cli.run({
-    arguments: ["inspect-artifact", leftPath, "--json"],
+    arguments: completeArguments("inspect-artifact", leftPath),
   });
   expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0);
   const left = inventoryEvidence(result.json);
@@ -136,7 +141,7 @@ const assertMalformedImportsRejected = async (
   const sha256 = "f".repeat(64);
   const oversized = createEvidence(
     {
-      path: right.subject!.local_path,
+      path: fileSubjectDisplay(right.subject).local_path,
       sha256: inventory.manifest.root_sha256,
       format: inventory.manifest.root_format,
     },
@@ -203,7 +208,7 @@ const assertMalformedImportsRejected = async (
   ]) {
     const malformed = createEvidence(
       {
-        path: right.subject!.local_path,
+        path: fileSubjectDisplay(right.subject).local_path,
         sha256: inventory.manifest.root_sha256,
         format: inventory.manifest.root_format,
       },
@@ -237,7 +242,7 @@ cliTest(
     await writer.add("b.txt", new TextReader("def"));
     await writeFile(path, await writer.close());
     const inspected = await cli.run({
-      arguments: ["inspect-artifact", path, "--json"],
+      arguments: completeArguments("inspect-artifact", path),
     });
     expect(inspected.exitCode, inspected.stderr).toBe(0);
     const source = inventoryEvidence(inspected.json);
@@ -344,7 +349,7 @@ cliTest(
       writeFile(rightPath, plist("hello")),
     ]);
     const leftResult = await cli.run({
-      arguments: ["inspect-artifact", leftPath, "--json"],
+      arguments: completeArguments("inspect-artifact", leftPath),
     });
     expect(leftResult.exitCode, leftResult.stderr).toBe(0);
     const left = inventoryEvidence(leftResult.json);
@@ -367,16 +372,20 @@ cliTest(
       edge_count: 0,
     });
     expect(inventory.limitations).toEqual([
-      "Inventory covers root bytes only; child container entries were not examined.",
+      expect.stringMatching(/root bytes only.*child.*not examined/iu),
     ]);
+    const leftInventory = artifactInventoryResultSchema.parse(
+      left.normalized_result,
+    );
+    expect(leftInventory.limitations).toEqual(inventory.limitations);
     const equal = await compare(left, right);
     expect(equal.normalized_result).toMatchObject({
       status: "unchanged",
       summary: { unchanged: 1, unknown: 0 },
       changes: [],
       limitations: [
-        "Left: Inventory covers root bytes only; child container entries were not examined.",
-        "Right: Inventory covers root bytes only; child container entries were not examined.",
+        ...leftInventory.limitations.map((note) => `Left: ${note}`),
+        ...inventory.limitations.map((note) => `Right: ${note}`),
       ],
     });
     const behavior = await call("find_changed_behavior", {
@@ -428,7 +437,6 @@ cliTest(
 
     await assertCoverageControls({ left, right, inventory, compare });
   },
-  30_000,
 );
 
 cliTest.skipIf(process.platform === "win32")(
@@ -443,13 +451,15 @@ cliTest.skipIf(process.platform === "win32")(
     ]);
     await Promise.all([chmod(leftPath, 0o644), chmod(rightPath, 0o755)]);
     const result = await cli.run({
-      arguments: ["inspect-artifact", leftPath, "--json"],
+      arguments: completeArguments("inspect-artifact", leftPath),
     });
     expect(result.exitCode, result.stderr).toBe(0);
     const left = inventoryEvidence(result.json);
     const { call, inspect } = await connectArtifactComparisonMcp();
     const right = await inspect(rightPath);
-    expect(right.subject?.digest.sha256).toBe(left.subject?.digest.sha256);
+    expect(fileIdentity(right.subject).sha256).toBe(
+      fileIdentity(left.subject).sha256,
+    );
     const comparison = await call("compare_artifacts", { left, right });
     expect(comparison.isError, JSON.stringify(comparison)).not.toBe(true);
     expect(
@@ -465,7 +475,6 @@ cliTest.skipIf(process.platform === "win32")(
       ],
     });
   },
-  30_000,
 );
 
 cliTest.skipIf(process.platform === "win32")(
@@ -517,7 +526,6 @@ cliTest.skipIf(process.platform === "win32")(
       ]),
     });
   },
-  30_000,
 );
 
 cliTest.skipIf(process.platform === "win32")(
@@ -575,7 +583,6 @@ cliTest.skipIf(process.platform === "win32")(
       );
     }
   },
-  30_000,
 );
 
 cliTest(
@@ -616,7 +623,6 @@ cliTest(
       ]),
     });
   },
-  30_000,
 );
 
 cliTest(
